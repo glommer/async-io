@@ -51,25 +51,22 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::mem;
-#[cfg(unix)]
+use std::rc::Rc;
+use std::cell::RefCell;
 use std::os::unix::io::RawFd;
-#[cfg(windows)]
-use std::os::windows::io::RawSocket;
 use std::panic::{self, RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Poll, Waker};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use concurrent_queue::ConcurrentQueue;
 use futures_lite::*;
-use once_cell::sync::Lazy;
-use vec_arena::Arena;
 
 use crate::sys;
+use crate::sys::{Source, SourceType, Wakers};
+use std::ffi::CString;
 
-static PARKER_COUNT: AtomicUsize = AtomicUsize::new(0);
+thread_local!(static LOCAL_REACTOR: Reactor = Reactor::new());
 
 /// Creates a parker and an associated unparker.
 ///
@@ -107,18 +104,12 @@ impl Parker {
     ///
     pub fn new() -> Parker {
         // Ensure `Reactor` is initialized now to prevent it from being initialized in `Drop`.
-        Reactor::get();
-
         let parker = Parker {
             unparker: Unparker {
-                inner: Arc::new(Inner {
-                    state: AtomicUsize::new(EMPTY),
-                    lock: Mutex::new(()),
-                    cvar: Condvar::new(),
+                inner: Rc::new(Inner {
                 }),
             },
         };
-        PARKER_COUNT.fetch_add(1, Ordering::SeqCst);
         parker
     }
 
@@ -141,6 +132,7 @@ impl Parker {
     pub fn park(&self) {
         self.unparker.inner.park(None);
     }
+
 
     /// Blocks until notified and then goes back into unnotified state, or times out after
     /// `duration`.
@@ -231,10 +223,7 @@ impl Parker {
 }
 
 impl Drop for Parker {
-    fn drop(&mut self) {
-        PARKER_COUNT.fetch_sub(1, Ordering::SeqCst);
-        Reactor::get().thread_unparker.unpark();
-    }
+    fn drop(&mut self) {}
 }
 
 impl Default for Parker {
@@ -251,7 +240,7 @@ impl fmt::Debug for Parker {
 
 /// Notifies a parker.
 pub struct Unparker {
-    inner: Arc<Inner>,
+    inner: Rc<Inner>,
 }
 
 impl UnwindSafe for Unparker {}
@@ -297,151 +286,22 @@ impl Clone for Unparker {
     }
 }
 
-const EMPTY: usize = 0;
-const PARKED: usize = 1;
-const POLLING: usize = 2;
-const NOTIFIED: usize = 3;
-
 struct Inner {
-    state: AtomicUsize,
-    lock: Mutex<()>,
-    cvar: Condvar,
 }
 
 impl Inner {
     fn park(&self, timeout: Option<Duration>) -> bool {
-        // If we were previously notified then we consume this notification and return quickly.
-        if self
-            .state
-            .compare_exchange(NOTIFIED, EMPTY, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            // Process available I/O events.
-            if let Some(reactor_lock) = Reactor::get().try_lock() {
-                let _ = reactor_lock.react(Some(Duration::from_secs(0)));
-            }
-            return true;
-        }
-
         // If the timeout is zero, then there is no need to actually block.
-        if let Some(dur) = timeout {
-            if dur == Duration::from_millis(0) {
-                // Process available I/O events.
-                if let Some(reactor_lock) = Reactor::get().try_lock() {
-                    let _ = reactor_lock.react(Some(Duration::from_secs(0)));
-                }
-                return false;
-            }
-        }
-
-        // Otherwise, we need to coordinate going to sleep.
-        let deadline = timeout.map(|t| Instant::now() + t);
-        loop {
-            let reactor_lock = Reactor::get().try_lock();
-
-            let state = match reactor_lock {
-                None => PARKED,
-                Some(_) => POLLING,
-            };
-            let mut m = self.lock.lock().unwrap();
-
-            match self
-                .state
-                .compare_exchange(EMPTY, state, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => {}
-                // Consume this notification to avoid spurious wakeups in the next park.
-                Err(NOTIFIED) => {
-                    // We must read `state` here, even though we know it will be `NOTIFIED`. This is
-                    // because `unpark` may have been called again since we read `NOTIFIED` in the
-                    // `compare_exchange` above. We must perform an acquire operation that synchronizes
-                    // with that `unpark` to observe any writes it made before the call to `unpark`. To
-                    // do that we must read from the write it made to `state`.
-                    let old = self.state.swap(EMPTY, Ordering::SeqCst);
-                    assert_eq!(old, NOTIFIED, "park state changed unexpectedly");
-                    return true;
-                }
-                Err(n) => panic!("inconsistent park_timeout state: {}", n),
-            }
-
-            match deadline {
-                None => {
-                    // Block the current thread on the conditional variable.
-                    match reactor_lock {
-                        None => m = self.cvar.wait(m).unwrap(),
-                        Some(reactor_lock) => {
-                            drop(m);
-
-                            let _ = reactor_lock.react(None);
-
-                            m = self.lock.lock().unwrap();
-                        }
-                    }
-
-                    match self.state.swap(EMPTY, Ordering::SeqCst) {
-                        NOTIFIED => return true, // got a notification
-                        PARKED | POLLING => {}   // spurious wakeup
-                        n => panic!("inconsistent state: {}", n),
-                    }
-                }
-                Some(deadline) => {
-                    // Wait with a timeout, and if we spuriously wake up or otherwise wake up from a
-                    // notification we just want to unconditionally set `state` back to `EMPTY`, either
-                    // consuming a notification or un-flagging ourselves as parked.
-                    let timeout = deadline.saturating_duration_since(Instant::now());
-
-                    m = match reactor_lock {
-                        None => self.cvar.wait_timeout(m, timeout).unwrap().0,
-                        Some(reactor_lock) => {
-                            drop(m);
-                            let _ = reactor_lock.react(Some(timeout));
-                            self.lock.lock().unwrap()
-                        }
-                    };
-
-                    match self.state.swap(EMPTY, Ordering::SeqCst) {
-                        NOTIFIED => return true, // got a notification
-                        PARKED | POLLING => {}   // no notification
-                        n => panic!("inconsistent state: {}", n),
-                    }
-
-                    if Instant::now() >= deadline {
-                        return false;
-                    }
-                }
-            }
-
-            drop(m);
-        }
+        // Process available I/O events.
+        let reactor_lock = Reactor::get().lock();
+        let _ = reactor_lock.react(timeout);
+        return false;
     }
 
-    pub fn unpark(&self) {
-        // To ensure the unparked thread will observe any writes we made before this call, we must
-        // perform a release operation that `park` can synchronize with. To do that we must write
-        // `NOTIFIED` even if `state` is already `NOTIFIED`. That is why this must be a swap rather
-        // than a compare-and-swap that returns if it reads `NOTIFIED` on failure.
-        let state = match self.state.swap(NOTIFIED, Ordering::SeqCst) {
-            EMPTY => return,    // no one was waiting
-            NOTIFIED => return, // already unparked
-            state => state,     // gotta go wake someone up
-        };
-
-        // There is a period between when the parked thread sets `state` to `PARKED` (or last
-        // checked `state` in the case of a spurious wakeup) and when it actually waits on `cvar`.
-        // If we were to notify during this period it would be ignored and then when the parked
-        // thread went to sleep it would never wake up. Fortunately, it has `lock` locked at this
-        // stage so we can acquire `lock` to wait until it is ready to receive the notification.
-        //
-        // Releasing `lock` before the call to `notify_one` means that when the parked thread wakes
-        // it doesn't get woken only to have to wait for us to release `lock`.
-        drop(self.lock.lock().unwrap());
-
-        if state == PARKED {
-            self.cvar.notify_one();
-        } else {
-            Reactor::get().notify();
-        }
-    }
+    // Because this is a Thread-per-core system it is impossible to unpark.
+    // We can only be awaken by some external event, and that will wake up the
+    // blocking system call in park().
+    pub fn unpark(&self) {}
 }
 
 /// The reactor.
@@ -451,27 +311,18 @@ impl Inner {
 ///
 /// There is only one global instance of this type, accessible by [`Reactor::get()`].
 pub(crate) struct Reactor {
-    /// Unparks the async-io thread.
-    thread_unparker: parking::Unparker,
-
     /// Raw bindings to epoll/kqueue/wepoll.
     sys: sys::Reactor,
 
     /// Ticker bumped before polling.
     ticker: AtomicUsize,
 
-    /// Registered sources.
-    sources: Mutex<Arena<Arc<Source>>>,
-
-    /// Temporary storage for I/O events when polling the reactor.
-    events: Mutex<sys::Events>,
-
     /// An ordered map of registered timers.
     ///
     /// Timers are in the order in which they fire. The `usize` in this type is a timer ID used to
     /// distinguish timers that fire at the same time. The `Waker` represents the task awaiting the
     /// timer.
-    timers: Mutex<BTreeMap<(Instant, usize), Waker>>,
+    timers: RefCell<BTreeMap<(Instant, usize), Waker>>,
 
     /// A queue of timer operations (insert and remove).
     ///
@@ -480,72 +331,23 @@ pub(crate) struct Reactor {
     timer_ops: ConcurrentQueue<TimerOp>,
 }
 
-impl Reactor {
-    /// Returns a reference to the reactor.
+impl<'a> Reactor {
+    fn new() -> Reactor {
+        Reactor {
+            sys: sys::Reactor::new().expect("cannot initialize I/O event notification"),
+            ticker: AtomicUsize::new(0),
+            timers: RefCell::new(BTreeMap::new()),
+            timer_ops: ConcurrentQueue::bounded(1000),
+        }
+    }
+
     pub(crate) fn get() -> &'static Reactor {
-        static REACTOR: Lazy<Reactor> = Lazy::new(|| {
-            let (parker, unparker) = parking::pair();
-
-            // Spawn a helper thread driving the reactor.
-            //
-            // Note that this thread is not exactly necessary, it's only here to help push things
-            // forward if there are no `Parker`s around.
-            thread::Builder::new()
-                .name("async-io".to_string())
-                .spawn(move || {
-                    let reactor = Reactor::get();
-                    let mut sleeps = 0u64;
-                    let mut last_tick = 0;
-
-                    loop {
-                        let tick = reactor.ticker.load(Ordering::SeqCst);
-
-                        if last_tick == tick {
-                            let reactor_lock = if sleeps >= 20 {
-                                Some(reactor.lock())
-                            } else {
-                                reactor.try_lock()
-                            };
-
-                            if let Some(reactor_lock) = reactor_lock {
-                                let _ = reactor_lock.react(None);
-                                last_tick = reactor.ticker.load(Ordering::SeqCst);
-                            }
-
-                            sleeps = 0;
-                        } else {
-                            last_tick = tick;
-                            sleeps += 1;
-                        }
-
-                        if PARKER_COUNT.load(Ordering::SeqCst) == 0 {
-                            sleeps = 0;
-                        } else {
-                            // Exponential backoff from 50us to 10ms.
-                            let delay_us = [50, 75, 100, 250, 500, 750, 1000, 2500, 5000]
-                                .get(sleeps as usize)
-                                .unwrap_or(&10_000);
-
-                            if parker.park_timeout(Duration::from_micros(*delay_us)) {
-                                // If woken up before timeout, reset the counter.
-                                sleeps = 0;
-                            }
-                        }
-                    }
-                })
-                .expect("cannot spawn async-io thread");
-
-            Reactor {
-                thread_unparker: unparker,
-                sys: sys::Reactor::new().expect("cannot initialize I/O event notification"),
-                ticker: AtomicUsize::new(0),
-                sources: Mutex::new(Arena::new()),
-                events: Mutex::new(sys::Events::new()),
-                timers: Mutex::new(BTreeMap::new()),
-                timer_ops: ConcurrentQueue::bounded(1000),
-            }
-        });
-        &REACTOR
+        unsafe {
+            LOCAL_REACTOR.with(|r| {
+                let rc = r as *const Reactor;
+                &*rc
+            })
+        }
     }
 
     /// Notifies the thread blocked on the reactor.
@@ -554,38 +356,77 @@ impl Reactor {
     }
 
     /// Registers an I/O source in the reactor.
-    pub(crate) fn insert_io(
+    pub(crate) fn insert_source(
         &self,
-        #[cfg(unix)] raw: RawFd,
-        #[cfg(windows)] raw: RawSocket,
-    ) -> io::Result<Arc<Source>> {
-        // Register the file descriptor.
-        self.sys.insert(raw)?;
-
-        // Create an I/O source for this file descriptor.
-        let mut sources = self.sources.lock().unwrap();
-        let key = sources.next_vacant();
-        let source = Arc::new(Source {
+        raw: RawFd,
+        source_type: SourceType) -> Rc<Source>
+    {
+        let source = Rc::new(Source {
             raw,
-            key,
-            wakers: Mutex::new(Wakers {
-                tick_readable: 0,
-                tick_writable: 0,
-                readers: Vec::new(),
-                writers: Vec::new(),
-            }),
+            wakers: RefCell::new(Wakers::new()),
+            source_type,
         });
-        sources.insert(source.clone());
 
+        source
+    }
+
+    pub(crate) fn write_dma(&self, raw : RawFd, buf : &'a [u8], pos : u64) -> Rc<Source> {
+        let source = self.insert_source(raw, SourceType::DmaWrite);
+        self.sys.write_dma(&source, buf, pos);
+        source
+    }
+
+    pub(crate) fn read_dma(&self, raw : RawFd, buf : &'a mut [u8], pos : u64) -> Rc<Source> {
+        let source = self.insert_source(raw, SourceType::DmaRead);
+        self.sys.read_dma(&source, buf, pos);
+        source
+    }
+
+    pub(crate) fn fdatasync(&self, raw : RawFd) -> Rc<Source> {
+        let source = self.insert_source(raw, SourceType::FdataSync);
+        self.sys.fdatasync(&source);
+        source
+    }
+
+    pub(crate) fn fallocate(&self, raw : RawFd,
+                            position: u64, size: u64,
+                            flags: libc::c_int)
+        -> Rc<Source>
+    {
+        let source = self.insert_source(raw, SourceType::Fallocate);
+        self.sys.fallocate(&source, position, size, flags);
+        source
+    }
+
+    pub(crate) fn close(&self, raw : RawFd) -> Rc<Source> {
+        let source = self.insert_source(raw, SourceType::Close);
+        self.sys.close(&source);
+        source
+    }
+
+    pub(crate) fn open_at(&self,
+                          dir   : RawFd,
+                          path  : &CString,
+                          flags : libc::c_int,
+                          mode  : libc::c_int
+    ) -> Rc<Source> {
+        let source = self.insert_source(dir, SourceType::Open);
+        self.sys.open_at(&source, path, flags, mode);
+        source
+    }
+
+    pub(crate) fn insert_pollable_io(&self, raw: RawFd) -> io::Result<Rc<Source>> {
+        let source = self.insert_source(raw, SourceType::PollableFd);
+        self.sys.insert(raw)?;
         Ok(source)
     }
 
+    /*
     /// Deregisters an I/O source from the reactor.
-    pub(crate) fn remove_io(&self, source: &Source) -> io::Result<()> {
-        let mut sources = self.sources.lock().unwrap();
-        sources.remove(source.key);
-        self.sys.remove(source.raw)
+    pub(crate) fn cancel_io(&self, source: &Source) {
+        self.sys.cancel_io(source)
     }
+    */
 
     /// Registers a timer in the reactor.
     ///
@@ -602,7 +443,7 @@ impl Reactor {
             .is_err()
         {
             // If the queue is full, drain it and try again.
-            let mut timers = self.timers.lock().unwrap();
+            let mut timers = self.timers.borrow_mut();
             self.process_timer_ops(&mut timers);
         }
 
@@ -617,7 +458,7 @@ impl Reactor {
         // Push a remove operation.
         while self.timer_ops.push(TimerOp::Remove(when, id)).is_err() {
             // If the queue is full, drain it and try again.
-            let mut timers = self.timers.lock().unwrap();
+            let mut timers = self.timers.borrow_mut();
             self.process_timer_ops(&mut timers);
         }
     }
@@ -625,23 +466,14 @@ impl Reactor {
     /// Locks the reactor, potentially blocking if the lock is held by another thread.
     fn lock(&self) -> ReactorLock<'_> {
         let reactor = self;
-        let events = self.events.lock().unwrap();
-        ReactorLock { reactor, events }
-    }
-
-    /// Attempts to lock the reactor.
-    fn try_lock(&self) -> Option<ReactorLock<'_>> {
-        self.events.try_lock().ok().map(|events| {
-            let reactor = self;
-            ReactorLock { reactor, events }
-        })
+        ReactorLock { reactor }
     }
 
     /// Processes ready timers and extends the list of wakers to wake.
     ///
     /// Returns the duration until the next timer before this method was called.
     fn process_timers(&self, wakers: &mut Vec<Waker>) -> Option<Duration> {
-        let mut timers = self.timers.lock().unwrap();
+        let mut timers = self.timers.borrow_mut();
         self.process_timer_ops(&mut timers);
 
         let now = Instant::now();
@@ -674,7 +506,7 @@ impl Reactor {
     }
 
     /// Processes queued timer operations.
-    fn process_timer_ops(&self, timers: &mut MutexGuard<'_, BTreeMap<(Instant, usize), Waker>>) {
+    fn process_timer_ops(&self, timers: &mut BTreeMap<(Instant, usize), Waker>) {
         // Process only as much as fits into the queue, or else this loop could in theory run
         // forever.
         for _ in 0..self.timer_ops.capacity().unwrap() {
@@ -694,12 +526,15 @@ impl Reactor {
 /// A lock on the reactor.
 struct ReactorLock<'a> {
     reactor: &'a Reactor,
-    events: MutexGuard<'a, sys::Events>,
 }
 
 impl ReactorLock<'_> {
     /// Processes new events, blocking until the first event or the timeout.
-    fn react(mut self, timeout: Option<Duration>) -> io::Result<()> {
+    fn react(self, timeout: Option<Duration>) -> io::Result<()> {
+        // FIXME: there must be a way to avoid this allocation
+        // Indeed it just showed in a profiler. We can cap the number of
+        // cqes produced, but this is used for timers as well. Need to
+        // be more careful, but doable.
         let mut wakers = Vec::new();
 
         // Process ready timers.
@@ -713,14 +548,14 @@ impl ReactorLock<'_> {
         };
 
         // Bump the ticker before polling I/O.
-        let tick = self
+        let _ = self
             .reactor
             .ticker
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
 
         // Block on I/O events.
-        let res = match self.reactor.sys.wait(&mut self.events, timeout) {
+        let res = match self.reactor.sys.wait(&mut wakers, timeout) {
             // No I/O events occurred.
             Ok(0) => {
                 if timeout != Some(Duration::from_secs(0)) {
@@ -731,44 +566,7 @@ impl ReactorLock<'_> {
             }
 
             // At least one I/O event occurred.
-            Ok(_) => {
-                // Iterate over sources in the event list.
-                let sources = self.reactor.sources.lock().unwrap();
-
-                for ev in self.events.iter() {
-                    // Check if there is a source in the table with this key.
-                    if let Some(source) = sources.get(ev.key) {
-                        let mut w = source.wakers.lock().unwrap();
-
-                        // Wake readers if a readability event was emitted.
-                        if ev.readable {
-                            w.tick_readable = tick;
-                            wakers.append(&mut w.readers);
-                        }
-
-                        // Wake writers if a writability event was emitted.
-                        if ev.writable {
-                            w.tick_writable = tick;
-                            wakers.append(&mut w.writers);
-                        }
-
-                        // Re-register if there are still writers or
-                        // readers. The can happen if e.g. we were
-                        // previously interested in both readability and
-                        // writability, but only one of them was emitted.
-                        if !(w.writers.is_empty() && w.readers.is_empty()) {
-                            self.reactor.sys.interest(
-                                source.raw,
-                                source.key,
-                                !w.readers.is_empty(),
-                                !w.writers.is_empty(),
-                            )?;
-                        }
-                    }
-                }
-
-                Ok(())
-            }
+            Ok(_) => { Ok(()) }
 
             // The syscall was interrupted.
             Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(()),
@@ -777,13 +575,10 @@ impl ReactorLock<'_> {
             Err(err) => Err(err),
         };
 
-        // Drop the lock before waking.
-        drop(self);
-
         // Wake up ready tasks.
         for waker in wakers {
             // Don't let a panicking waker blow everything up.
-            let _ = panic::catch_unwind(|| waker.wake());
+            let _ = panic::catch_unwind(|| waker.wake() );
         }
 
         res
@@ -796,77 +591,33 @@ enum TimerOp {
     Remove(Instant, usize),
 }
 
-/// A registered source of I/O events.
-#[derive(Debug)]
-pub(crate) struct Source {
-    /// Raw file descriptor on Unix platforms.
-    #[cfg(unix)]
-    pub(crate) raw: RawFd,
-
-    /// Raw socket handle on Windows.
-    #[cfg(windows)]
-    pub(crate) raw: RawSocket,
-
-    /// The key of this source obtained during registration.
-    key: usize,
-
-    /// Tasks interested in events on this source.
-    wakers: Mutex<Wakers>,
-}
-
-/// Tasks interested in events on a source.
-#[derive(Debug)]
-struct Wakers {
-    /// Last reactor tick that delivered a readability event.
-    tick_readable: usize,
-
-    /// Last reactor tick that delivered a writability event.
-    tick_writable: usize,
-
-    /// Tasks waiting for the next readability event.
-    readers: Vec<Waker>,
-
-    /// Tasks waiting for the next writability event.
-    writers: Vec<Waker>,
-}
-
+// FIXME: source should be partitioned in two, write_dma and read_dma should not be allowed
+// in files that don't support it, and same for readable() writable()
 impl Source {
+    pub(crate) async fn collect_rw(&self) -> io::Result<usize> {
+        future::poll_fn(|cx| {
+            let mut w = self.wakers.borrow_mut();
+
+            if let Some(result) = w.result.take() {
+                return Poll::Ready(result);
+            }
+
+            w.waiters.push(cx.waker().clone());
+            Poll::Pending
+        }).await
+    }
+
     /// Waits until the I/O source is readable.
     pub(crate) async fn readable(&self) -> io::Result<()> {
-        let mut ticks = None;
-
         future::poll_fn(|cx| {
-            let mut w = self.wakers.lock().unwrap();
+            let mut w = self.wakers.borrow_mut();
 
-            // Check if the reactor has delivered a readability event.
-            if let Some((a, b)) = ticks {
-                // If `tick_readable` has changed to a value other than the old reactor tick, that
-                // means a newer reactor tick has delivered a readability event.
-                if w.tick_readable != a && w.tick_readable != b {
-                    return Poll::Ready(Ok(()));
-                }
+            if let Some(_) = w.result.take() {
+                return Poll::Ready(Ok(()));
             }
 
-            // If there are no other readers, re-register in the reactor.
-            if w.readers.is_empty() {
-                Reactor::get()
-                    .sys
-                    .interest(self.raw, self.key, true, !w.writers.is_empty())?;
-            }
-
-            // Register the current task's waker if not present already.
-            if w.readers.iter().all(|w| !w.will_wake(cx.waker())) {
-                w.readers.push(cx.waker().clone());
-            }
-
-            // Remember the current ticks.
-            if ticks.is_none() {
-                ticks = Some((
-                    Reactor::get().ticker.load(Ordering::SeqCst),
-                    w.tick_readable,
-                ));
-            }
-
+            Reactor::get().sys.interest(self, true, false);
+            w.waiters.push(cx.waker().clone());
             Poll::Pending
         })
         .await
@@ -874,40 +625,15 @@ impl Source {
 
     /// Waits until the I/O source is writable.
     pub(crate) async fn writable(&self) -> io::Result<()> {
-        let mut ticks = None;
-
         future::poll_fn(|cx| {
-            let mut w = self.wakers.lock().unwrap();
+            let mut w = self.wakers.borrow_mut();
 
-            // Check if the reactor has delivered a writability event.
-            if let Some((a, b)) = ticks {
-                // If `tick_writable` has changed to a value other than the old reactor tick, that
-                // means a newer reactor tick has delivered a writability event.
-                if w.tick_writable != a && w.tick_writable != b {
-                    return Poll::Ready(Ok(()));
-                }
+            if let Some(_) = w.result.take() {
+                return Poll::Ready(Ok(()));
             }
 
-            // If there are no other writers, re-register in the reactor.
-            if w.writers.is_empty() {
-                Reactor::get()
-                    .sys
-                    .interest(self.raw, self.key, !w.readers.is_empty(), true)?;
-            }
-
-            // Register the current task's waker if not present already.
-            if w.writers.iter().all(|w| !w.will_wake(cx.waker())) {
-                w.writers.push(cx.waker().clone());
-            }
-
-            // Remember the current ticks.
-            if ticks.is_none() {
-                ticks = Some((
-                    Reactor::get().ticker.load(Ordering::SeqCst),
-                    w.tick_writable,
-                ));
-            }
-
+            Reactor::get().sys.interest(self, false, true);
+            w.waiters.push(cx.waker().clone());
             Poll::Pending
         })
         .await

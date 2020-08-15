@@ -35,17 +35,15 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
-#[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
-#[cfg(unix)]
 use std::{
-    os::unix::io::{AsRawFd, RawFd},
+    os::unix::io::{AsRawFd, RawFd, FromRawFd},
     os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream},
     path::Path,
+    hash::{Hash, Hasher},
 };
 
 use futures_lite::io::{AsyncRead, AsyncWrite};
@@ -53,7 +51,10 @@ use futures_lite::stream::{self, Stream};
 use futures_lite::{future, pin};
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::parking::{Reactor, Source};
+use crate::parking::Reactor;
+use crate::sys::Source;
+
+use std::ffi::CString;
 
 pub mod parking;
 mod sys;
@@ -234,13 +235,12 @@ impl Future for Timer {
 #[derive(Debug)]
 pub struct Async<T> {
     /// A source registered in the reactor.
-    source: Arc<Source>,
+    source: Rc<Source>,
 
     /// The inner I/O handle.
     io: Option<Box<T>>,
 }
 
-#[cfg(unix)]
 impl<T: AsRawFd> Async<T> {
     /// Creates an async I/O handle.
     ///
@@ -267,55 +267,14 @@ impl<T: AsRawFd> Async<T> {
     /// ```
     pub fn new(io: T) -> io::Result<Async<T>> {
         Ok(Async {
-            source: Reactor::get().insert_io(io.as_raw_fd())?,
+            source: Reactor::get().insert_pollable_io(io.as_raw_fd())?,
             io: Some(Box::new(io)),
         })
     }
 }
 
-#[cfg(unix)]
 impl<T: AsRawFd> AsRawFd for Async<T> {
     fn as_raw_fd(&self) -> RawFd {
-        self.source.raw
-    }
-}
-
-#[cfg(windows)]
-impl<T: AsRawSocket> Async<T> {
-    /// Creates an async I/O handle.
-    ///
-    /// This function will put the handle in non-blocking mode and register it in
-    /// [epoll]/[kqueue]/[wepoll].
-    ///
-    /// On Unix systems, the handle must implement `AsRawFd`, while on Windows it must implement
-    /// `AsRawSocket`.
-    ///
-    /// [epoll]: https://en.wikipedia.org/wiki/Epoll
-    /// [kqueue]: https://en.wikipedia.org/wiki/Kqueue
-    /// [wepoll]: https://github.com/piscisaureus/wepoll
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use async_io::Async;
-    /// use std::net::{SocketAddr, TcpListener};
-    ///
-    /// # futures_lite::future::block_on(async {
-    /// let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
-    /// let listener = Async::new(listener)?;
-    /// # std::io::Result::Ok(()) });
-    /// ```
-    pub fn new(io: T) -> io::Result<Async<T>> {
-        Ok(Async {
-            source: Reactor::get().insert_io(io.as_raw_socket())?,
-            io: Some(Box::new(io)),
-        })
-    }
-}
-
-#[cfg(windows)]
-impl<T: AsRawSocket> AsRawSocket for Async<T> {
-    fn as_raw_socket(&self) -> RawSocket {
         self.source.raw
     }
 }
@@ -370,7 +329,6 @@ impl<T> Async<T> {
     /// ```
     pub fn into_inner(mut self) -> io::Result<T> {
         let io = *self.io.take().unwrap();
-        Reactor::get().remove_io(&self.source)?;
         Ok(io)
     }
 
@@ -478,10 +436,13 @@ impl<T> Async<T> {
     ) -> io::Result<R> {
         let mut op = op;
         loop {
-            match op(self.get_mut()) {
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+             match op(self.get_mut()) {
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => { }
                 res => return res,
             }
+            // FIXME: I am not convinced that we should do what seastar does
+            // and allow reads outside pollers for our use case. We'll see.
+            // For now the main goal is to test uring, so every read goes there.
             optimistic(self.readable()).await?;
         }
     }
@@ -561,9 +522,6 @@ impl<T> Async<T> {
 impl<T> Drop for Async<T> {
     fn drop(&mut self) {
         if self.io.is_some() {
-            // Deregister and ignore errors because destructors should not panic.
-            let _ = Reactor::get().remove_io(&self.source);
-
             // Drop the I/O handle to close it.
             self.io.take();
         }
@@ -664,6 +622,146 @@ where
     }
 }
 
+fn align_up(v: u64, align: u64) -> u64 {
+    (v + align - 1) & !(align - 1)
+}
+
+fn align_down(v: u64, align: u64) -> u64 {
+    v & !(align - 1)
+}
+
+#[derive(Debug)]
+/// Constructs a file that can issue DMA operations.
+/// All access uses Direct I/O, and all operations including
+/// open and close are asynchronous.
+pub struct DmaFile {
+    file : std::fs::File,
+}
+
+impl DmaFile {
+    // FIXME: Don't assume 512, we can read this info from sysfs
+    /// align a value up to the minimum alignment needed to access this file
+    pub fn align_up(&self, v: u64) -> u64 {
+        align_up(v, 512)
+    }
+
+    /// align a value down to the minimum alignment needed to access this file
+    pub fn align_down(&self, v: u64) -> u64 {
+        align_down(v, 512)
+    }
+
+    /// Constructs a a new DMA file
+    pub fn new(file : std::fs::File) -> io::Result<DmaFile> {
+        sys::add_flag(file.as_raw_fd(), libc::O_DIRECT | libc::O_DSYNC)?;
+        Ok(DmaFile {
+            file,
+        })
+    }
+}
+
+impl AsRawFd for DmaFile {
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
+
+impl PartialEq for DmaFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_raw_fd() == other.as_raw_fd()
+    }
+}
+
+impl Eq for DmaFile {}
+
+impl Hash for DmaFile {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_raw_fd().hash(state);
+    }
+}
+
+impl Default for DmaFile {
+    fn default() -> Self {
+        DmaFile {
+            file : unsafe { std::fs::File::from_raw_fd(-1) },
+        }
+    }
+}
+
+impl Drop for DmaFile {
+    fn drop(&mut self) {
+        if self.as_raw_fd() != -1 {
+            eprintln!("DmaFile dropped while still active. Should have been async closed. I will close it and turn a leak bug into a performance bug. Please investigate");
+            drop(&self.file);
+        }
+    }
+}
+
+impl DmaFile {
+    async fn open_at(dir : RawFd, path : &str, flags: libc::c_int, mode: libc::c_int) -> io::Result<DmaFile> {
+        let path = CString::new(path)?;
+        let source = Reactor::get().open_at(dir, &path, flags, mode);
+        let fd = source.collect_rw().await?;
+        Ok(DmaFile {
+            file : unsafe { std::fs::File::from_raw_fd(fd as _) },
+        })
+    }
+
+    /// Similar to create() in the standard library, but returns a DMA file
+    pub async fn create(path : &str) -> io::Result<DmaFile> {
+        let flags = libc::O_DIRECT | libc::O_DSYNC | libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY;
+        DmaFile::open_at(-1 as _, path, flags, 0o644).await
+    }
+
+    /// Similar to open() in the standard library, but returns a DMA file
+    pub async fn open(path : &str) -> io::Result<DmaFile> {
+        let flags = libc::O_DIRECT | libc::O_DSYNC | libc::O_RDONLY;
+        DmaFile::open_at(-1 as _, path, flags, 0644).await
+    }
+
+    /// Writes the buffer in buf to a specific position in the file.
+    ///
+    /// It is expected that the buffer is properly aligned for Direct I/O.
+    /// In most platforms that means 512 bytes.
+    pub async fn write_dma(&self, buf : &[u8], pos : u64) -> io::Result<usize> {
+        let source = Reactor::get().write_dma(self.as_raw_fd(), buf, pos);
+        source.collect_rw().await
+    }
+
+    /// Reads into buffer in buf from a specific position in the file.
+    ///
+    /// It is expected that the buffer is properly aligned for Direct I/O.
+    /// In most platforms that means 512 bytes.
+    pub async fn read_dma(&self, buf : &mut [u8], pos : u64) -> io::Result<usize> {
+        let source = Reactor::get().read_dma(self.as_raw_fd(), buf, pos);
+        source.collect_rw().await
+    }
+    
+    /// Issues fdatasync into the underlying file. 
+    pub async fn fdatasync(&self) -> io::Result<()> {
+        let source = Reactor::get().fdatasync(self.as_raw_fd());
+        source.collect_rw().await?;
+        Ok(())
+    }
+
+    /// FIXME: file extension, and not general fallocate, is probably a better
+    /// abstraction
+    pub async fn fallocate(&self, position: u64, size: u64) -> io::Result<()> {
+        let flags = libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE;
+        let source = Reactor::get().fallocate(self.as_raw_fd(), position, size, flags);
+        source.collect_rw().await?;
+        Ok(())
+    }
+
+    /// Closes this DMA file.
+    pub async fn close(&mut self) -> io::Result<()> {
+        let source = Reactor::get().close(self.as_raw_fd());
+        source.collect_rw().await?;
+        self.file = unsafe { std::fs::File::from_raw_fd(-1) };
+        Ok(())
+    }
+}
+
 impl Async<TcpListener> {
     /// Creates a TCP listener bound to the specified address.
     ///
@@ -728,7 +826,7 @@ impl Async<TcpListener> {
     /// }
     /// # std::io::Result::Ok(()) });
     /// ```
-    pub fn incoming(&self) -> impl Stream<Item = io::Result<Async<TcpStream>>> + Send + Unpin + '_ {
+    pub fn incoming(&self) -> impl Stream<Item = io::Result<Async<TcpStream>>> +  Unpin + '_ {
         Box::pin(stream::unfold(self, |listener| async move {
             let res = listener.accept().await.map(|(stream, _)| stream);
             Some((res, listener))
@@ -765,10 +863,7 @@ impl Async<TcpStream> {
         socket.set_nonblocking(true)?;
         socket.connect(&addr.into()).or_else(|err| {
             // Check for EINPROGRESS on Unix and WSAEWOULDBLOCK on Windows.
-            #[cfg(unix)]
             let in_progress = err.raw_os_error() == Some(libc::EINPROGRESS);
-            #[cfg(windows)]
-            let in_progress = err.kind() == io::ErrorKind::WouldBlock;
 
             // If connect results with an "in progress" error, that's not an error.
             if in_progress {
@@ -992,7 +1087,6 @@ impl Async<UdpSocket> {
     }
 }
 
-#[cfg(unix)]
 impl Async<UnixListener> {
     /// Creates a UDS listener bound to the specified path.
     ///
@@ -1057,7 +1151,7 @@ impl Async<UnixListener> {
     /// ```
     pub fn incoming(
         &self,
-    ) -> impl Stream<Item = io::Result<Async<UnixStream>>> + Send + Unpin + '_ {
+    ) -> impl Stream<Item = io::Result<Async<UnixStream>>> + Unpin + '_ {
         Box::pin(stream::unfold(self, |listener| async move {
             let res = listener.accept().await.map(|(stream, _)| stream);
             Some((res, listener))
@@ -1065,7 +1159,6 @@ impl Async<UnixListener> {
     }
 }
 
-#[cfg(unix)]
 impl Async<UnixStream> {
     /// Creates a UDS stream connected to the specified path.
     ///
@@ -1120,7 +1213,6 @@ impl Async<UnixStream> {
     }
 }
 
-#[cfg(unix)]
 impl Async<UnixDatagram> {
     /// Creates a UDS datagram socket bound to the specified path.
     ///

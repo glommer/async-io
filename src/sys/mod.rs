@@ -1,76 +1,76 @@
-//! Bindings to epoll/kqueue/wepoll.
-//!
-//! On all platforms the I/O reactor is used in oneshot mode.
-//!
-//! Since this module is just syscalls to the operating system, it is the only place where unsafe
-//! code is required.
-
 use std::io;
 use std::mem::ManuallyDrop;
 use std::net::{Shutdown, TcpStream};
-#[cfg(unix)]
 use std::os::unix::io::{FromRawFd, RawFd};
-#[cfg(windows)]
-use std::os::windows::io::{FromRawSocket, RawSocket};
+use std::cell::RefCell;
+use std::task::Waker;
 
-use cfg_if::cfg_if;
+mod uring;
+pub use self::uring::*;
 
-/// Calls a libc function and results in `io::Result`.
-#[cfg(unix)]
-macro_rules! syscall {
-    ($fn:ident $args:tt) => {{
-        let res = unsafe { libc::$fn $args };
-        if res == -1 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(res)
-        }
-    }};
+#[derive(Debug)]
+pub(crate) enum SourceType {
+    DmaWrite,
+    DmaRead,
+    PollableFd,
+    Open,
+    FdataSync,
+    Fallocate,
+    Close,
 }
 
-cfg_if! {
-    if #[cfg(any(target_os = "linux", target_os = "android", target_os = "illumos"))] {
-        mod epoll;
-        pub use self::epoll::*;
-    } else if #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-    ))] {
-        mod kqueue;
-        pub use self::kqueue::*;
-    } else if #[cfg(target_os = "windows")] {
-        mod wepoll;
-        pub use self::wepoll::*;
-    } else {
-        compile_error!("async-io does not support this target OS");
+/// Tasks interested in events on a source.
+#[derive(Debug)]
+pub(crate) struct Wakers {
+    /// Raw result of the operation.
+    pub(crate) result : Option<io::Result<usize>>,
+
+    /// Tasks waiting for the next event.
+    pub(crate) waiters: Vec<Waker>,
+}
+
+impl Wakers {
+    pub(crate) fn new() -> Self {
+        Wakers {
+            result : None,
+            waiters: Vec::new(),
+        }
     }
 }
 
-/// An event reported by epoll/kqueue/wepoll.
-pub struct Event {
-    /// Key passed when registering interest in the I/O handle.
-    pub key: usize,
-    /// Is the I/O handle readable?
-    pub readable: bool,
-    /// Is the I/O handle writable?
-    pub writable: bool,
+/// A registered source of I/O events.
+#[derive(Debug)]
+pub struct Source {
+    /// Raw file descriptor on Unix platforms.
+    pub(crate) raw: RawFd,
+
+    /// Tasks interested in events on this source.
+    pub(crate) wakers: RefCell<Wakers>,
+
+    pub(crate) source_type : SourceType,
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        let w = self.wakers.get_mut();
+        if !w.waiters.is_empty() {
+            panic!("Attempting to release a source with pending waiters!");
+            // This cancellation will be problematic, because
+            // the operation may still be in-flight. If it returns
+            // later it will point to garbage memory.
+        //    crate::parking::Reactor::get().cancel_io(self);
+        }
+    }
 }
 
 /// Shuts down the write side of a socket.
 ///
 /// If this source is not a socket, the `shutdown()` syscall error is ignored.
-pub fn shutdown_write(#[cfg(unix)] raw: RawFd, #[cfg(windows)] raw: RawSocket) -> io::Result<()> {
+pub fn shutdown_write(raw: RawFd) -> io::Result<()> {
     // This may not be a TCP stream, but that's okay. All we do is call `shutdown()` on the raw
     // descriptor and ignore errors if it's not a socket.
     let res = unsafe {
-        #[cfg(unix)]
         let stream = ManuallyDrop::new(TcpStream::from_raw_fd(raw));
-        #[cfg(windows)]
-        let stream = ManuallyDrop::new(TcpStream::from_raw_socket(raw));
         stream.shutdown(Shutdown::Write)
     };
 
