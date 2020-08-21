@@ -67,7 +67,7 @@ use concurrent_queue::ConcurrentQueue;
 use futures_lite::*;
 
 use crate::sys;
-use crate::sys::{Source, SourceType};
+use crate::sys::{DmaBuffer, Source, SourceType};
 
 thread_local!(static LOCAL_REACTOR: Reactor = Reactor::new());
 
@@ -357,6 +357,10 @@ impl<'a> Reactor {
         self.sys.notify().expect("failed to notify reactor");
     }
 
+    pub(crate) fn alloc_dma_buffer(&self, size: usize) -> DmaBuffer<'_> {
+        self.sys.alloc_dma_buffer(size)
+    }
+
     pub(crate) fn write_dma(&self, raw : RawFd, buf : &'a [u8], pos : u64) -> Pin<Box<Source>> {
         let source = sys::Source::new(raw, SourceType::DmaWrite);
         self.sys.write_dma(&source.as_ref(), buf, pos);
@@ -411,6 +415,14 @@ impl<'a> Reactor {
         Ok(source)
     }
 
+    pub(crate) fn register_file(&self, raw: RawFd) {
+        let source = sys::Source::new(raw, SourceType::FilesUpdate(Vec::new()));
+        self.sys.register_file(&source, raw);
+    }
+
+    pub(crate) fn unregister_file(&self, fd: RawFd) {
+        self.sys.unregister_file(fd);
+    }
     /*
     /// Deregisters an I/O source from the reactor.
     pub(crate) fn cancel_io(&self, source: &Source) {

@@ -63,8 +63,11 @@ pub(crate) fn sync_open(path: &Path, flags: libc::c_int, mode: libc::c_int) -> i
     syscall!(open(path as _, flags, mode))
 }
 
+mod uring_buffers;
 mod uring;
 pub use self::uring::*;
+pub use self::uring_buffers::*;
+pub type DmaBuffer<'a> = UringDmaBuffer<'a>;
 
 #[derive(Debug)]
 pub(crate) enum SourceType {
@@ -76,6 +79,7 @@ pub(crate) enum SourceType {
     Fallocate,
     Close,
     LinkRings(bool),
+    FilesUpdate(Vec<RawFd>),
 }
 
 /// Tasks interested in events on a source.

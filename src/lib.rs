@@ -763,6 +763,7 @@ impl Default for DmaFile {
 impl Drop for DmaFile {
     fn drop(&mut self) {
         if self.as_raw_fd() != -1 {
+            Reactor::get().unregister_file(self.as_raw_fd());
             eprintln!("DmaFile dropped while still active. Should have been async closed. I will close it and turn a leak bug into a performance bug. Please investigate");
             drop(&self.file);
         }
@@ -777,6 +778,7 @@ impl DmaFile {
     {
         let source = Reactor::get().open_at(dir, path, flags, mode);
         let fd = source.collect_rw().await?;
+        Reactor::get().register_file(fd as _);
         Ok(DmaFile {
             file : unsafe { std::fs::File::from_raw_fd(fd as _) },
             o_direct_alignment: 4096,
@@ -859,6 +861,7 @@ impl DmaFile {
 
     /// Closes this DMA file.
     pub async fn close(&mut self) -> io::Result<()> {
+        Reactor::get().unregister_file(self.as_raw_fd());
         let source = Reactor::get().close(self.as_raw_fd());
         source.collect_rw().await?;
         self.file = unsafe { std::fs::File::from_raw_fd(-1) };

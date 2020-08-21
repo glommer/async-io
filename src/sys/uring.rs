@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use nix::poll::PollFlags;
 use std::ffi::CStr;
 
+use crate::sys::uring_buffers::{UringSlab, UringDmaBuffer};
 use crate::sys::{Source, SourceType};
 
 pub(crate) fn add_flag(fd : RawFd, flag : libc::c_int) -> io::Result<()> {
@@ -125,20 +126,61 @@ struct PollRing {
     submission_queue: VecDeque<UringDescriptor>,
     submitted: u64,
     completed: u64,
+    buffers_1k: UringSlab,
+    buffers_4k: UringSlab,
+    buffers_8k: UringSlab,
+    buffers_16k: UringSlab,
+    buffers_256k: UringSlab,
 }
 
 impl PollRing {
     fn new(size: usize) -> io::Result<Self> {
+        let ring =  iou::IoUring::new_with_flags(size as _,
+                                                 iou::SetupFlags::IOPOLL)?;
+
+        let mut buffers = Vec::with_capacity(8);
+        let mut buffers_1k = UringSlab::new(1 << 10);
+        let mut buffers_4k = UringSlab::new(4 << 10);
+        let mut buffers_8k = UringSlab::new(8 << 10);
+        let mut buffers_16k = UringSlab::new(16 << 10);
+        let mut buffers_256k = UringSlab::new(256 << 10);
+
+        buffers.push(buffers_1k.as_io_slice());
+        buffers.push(buffers_4k.as_io_slice());
+        buffers.push(buffers_8k.as_io_slice());
+        buffers.push(buffers_16k.as_io_slice());
+        buffers.push(buffers_256k.as_io_slice());
+
+        ring.registrar().register_buffers(&buffers)?;
+
         Ok(PollRing {
             submitted: 0,
             completed: 0,
-            ring: iou::IoUring::new_with_flags(size as _, iou::SetupFlags::IOPOLL)?,
+            ring,
             submission_queue : VecDeque::with_capacity(size * 4),
+            buffers_1k,
+            buffers_4k,
+            buffers_8k,
+            buffers_16k,
+            buffers_256k,
         })
     }    
 
     fn can_sleep(&self) -> bool {
         return self.submitted == self.completed
+    }
+
+    pub(crate) fn alloc_dma_buffer<'a>(&'a mut self, size: usize) -> UringDmaBuffer<'a> {
+        self.buffers_256k.alloc_buffer(size).expect("FIXME")
+    }
+}
+
+impl Drop for PollRing {
+    fn drop(&mut self) {
+        match self.ring.registrar().unregister_buffers() {
+            Err(x) => eprintln!("Failed to unregister buffers!: {:?}", x),
+            Ok(_) => {},
+        }
     }
 }
 
@@ -155,7 +197,7 @@ impl UringCommon for PollRing {
     }
 
     fn consume_one_event(&mut self, wakers : &mut Vec<Waker>) -> Option<()> {
-        process_one_event(self.ring.peek_for_cqe(), |source| { None }, wakers)
+        process_one_event(self.ring.peek_for_cqe(), |_| { None }, wakers)
     }
 
     fn submit_one_event(&mut self) -> Option<()> {
@@ -282,11 +324,12 @@ impl UringCommon for SleepableRing {
 }
 
 pub struct Reactor {
+    // FIXME: it is starting to feel we should clean this up to a Inner pattern
     main_ring: RefCell<SleepableRing>,
     latency_ring: RefCell<SleepableRing>,
     poll_ring: RefCell<PollRing>,
     link_rings_src: RefCell<Pin<Box<Source>>>,
-    files_registered: Option<RefCell<Vec<libc::c_int>>>,
+    files_registered: RefCell<Vec<libc::c_int>>,
 }
 
 fn common_flags() -> PollFlags {
@@ -337,17 +380,36 @@ impl Reactor {
         let latency_ring = SleepableRing::new(128)?;
         let link_fd = latency_ring.ring_fd();
 
+        let mut files_registered = Vec::with_capacity(128);
+        for _ in 0..128 {
+            files_registered.push(-1);
+        }
+
+        let xx = main_ring.ring.registrar().register_files(&files_registered);
+        println!("Result of registrar: {:?}", xx);
+
         Ok(Reactor {
             main_ring        : RefCell::new(main_ring),
             latency_ring     : RefCell::new(latency_ring),
             poll_ring        : RefCell::new(PollRing::new(128)?),
             link_rings_src   : RefCell::new(Source::new(link_fd, SourceType::LinkRings(false))),
+            files_registered : RefCell::new(files_registered),
         })
-    }
-
-    fn register_fd(&self, fd: RawFd) {
 
     }
+
+    pub(crate) fn alloc_dma_buffer(&self, size: usize) -> UringDmaBuffer<'_> {
+        let mut poll_ring = self.poll_ring.borrow_mut();
+        (*poll_ring).alloc_dma_buffer(size)
+    }
+
+    pub(crate) fn register_file(&self, source: &Pin<Box<Source>>, fd: RawFd) {
+    }
+
+    pub(crate) fn unregister_file(&self, fd: RawFd) {
+
+    }
+
     pub(crate) fn interest(&self, source : &Source, read: bool, write: bool) {
         let mut flags = common_flags();
         if read {
