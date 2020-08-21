@@ -4,6 +4,64 @@ use std::net::{Shutdown, TcpStream};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::cell::RefCell;
 use std::task::Waker;
+use std::pin::Pin;
+use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::marker::PhantomPinned;
+use std::ffi::CString;
+
+macro_rules! syscall {
+    ($fn:ident $args:tt) => {{
+        let res = unsafe { libc::$fn $args };
+        if res == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(res)
+        }
+    }};
+}
+
+const FS_XFLAG_EXTSIZE: u32 = 0x00000800;
+
+#[repr(C, packed)]
+pub struct Fsxattr {
+    fsx_xflags : u32,
+    fsx_extsize : u32,
+    fsx_nextents : u32,
+    fsx_projid : u32,
+    fsx_cowextsize : u32,
+    fsx_pad: u64,
+}
+
+const FS_SETXATTR_MAGIC: u8 = b'X';
+const FS_SETXATTR_TYPE_MODE: u8 = 32;
+ioctl_write_ptr!(set_fsxattr, FS_SETXATTR_MAGIC, FS_SETXATTR_TYPE_MODE, Fsxattr);
+
+pub(crate) fn fs_hint_extentsize(fd: RawFd, size: usize) -> nix::Result<i32> {
+    let attr = Fsxattr {
+        fsx_xflags : FS_XFLAG_EXTSIZE,
+        fsx_extsize : size as u32,
+        fsx_nextents : 0,
+        fsx_projid : 0,
+        fsx_cowextsize : 0,
+        fsx_pad: 0,
+    };
+    unsafe { set_fsxattr(fd, &attr) }
+}
+
+pub(crate) fn truncate_file(fd: RawFd, size: u64) -> io::Result<()> {
+    syscall!(ftruncate(fd, size as i64))?;
+    Ok(())
+}
+
+pub(crate) fn duplicate_file(fd: RawFd) -> io::Result<RawFd> {
+    syscall!(dup(fd))
+}
+
+pub(crate) fn sync_open(path: &Path, flags: libc::c_int, mode: libc::c_int) -> io::Result<RawFd> {
+    let path = path.as_os_str().as_bytes().as_ptr();
+    syscall!(open(path as _, flags, mode))
+}
 
 mod uring;
 pub use self::uring::*;
@@ -13,10 +71,11 @@ pub(crate) enum SourceType {
     DmaWrite,
     DmaRead,
     PollableFd,
-    Open,
+    Open(CString),
     FdataSync,
     Fallocate,
     Close,
+    LinkRings(bool),
 }
 
 /// Tasks interested in events on a source.
@@ -48,6 +107,32 @@ pub struct Source {
     pub(crate) wakers: RefCell<Wakers>,
 
     pub(crate) source_type : SourceType,
+
+    _pin: PhantomPinned,
+}
+
+impl Source {
+    /// Registers an I/O source in the reactor.
+    pub(crate) fn new(raw: RawFd, source_type: SourceType) -> Pin<Box<Source>> {
+        let b = Box::new(Source {
+            _pin: PhantomPinned,
+            raw,
+            wakers: RefCell::new(Wakers::new()),
+            source_type,
+        });
+        b.into()
+    }
+
+    pub(crate) fn as_ptr(self: Pin<&Self>) -> *const Self {
+        self.get_ref() as *const Self
+    }
+
+    pub(crate) fn update_source_type(self: Pin<&mut Self>, source_type: SourceType) {
+        unsafe {
+            let source = self.get_unchecked_mut();
+            source.source_type = source_type;
+        }
+    }
 }
 
 impl Drop for Source {

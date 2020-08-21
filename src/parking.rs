@@ -51,6 +51,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::mem;
+use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::ffi::CString;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::os::unix::io::RawFd;
@@ -58,13 +61,13 @@ use std::panic::{self, RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
+use std::pin::Pin;
 
 use concurrent_queue::ConcurrentQueue;
 use futures_lite::*;
 
 use crate::sys;
-use crate::sys::{Source, SourceType, Wakers};
-use std::ffi::CString;
+use crate::sys::{Source, SourceType};
 
 thread_local!(static LOCAL_REACTOR: Reactor = Reactor::new());
 
@@ -132,7 +135,6 @@ impl Parker {
     pub fn park(&self) {
         self.unparker.inner.park(None);
     }
-
 
     /// Blocks until notified and then goes back into unnotified state, or times out after
     /// `duration`.
@@ -355,68 +357,56 @@ impl<'a> Reactor {
         self.sys.notify().expect("failed to notify reactor");
     }
 
-    /// Registers an I/O source in the reactor.
-    pub(crate) fn insert_source(
-        &self,
-        raw: RawFd,
-        source_type: SourceType) -> Rc<Source>
-    {
-        let source = Rc::new(Source {
-            raw,
-            wakers: RefCell::new(Wakers::new()),
-            source_type,
-        });
-
+    pub(crate) fn write_dma(&self, raw : RawFd, buf : &'a [u8], pos : u64) -> Pin<Box<Source>> {
+        let source = sys::Source::new(raw, SourceType::DmaWrite);
+        self.sys.write_dma(&source.as_ref(), buf, pos);
         source
     }
 
-    pub(crate) fn write_dma(&self, raw : RawFd, buf : &'a [u8], pos : u64) -> Rc<Source> {
-        let source = self.insert_source(raw, SourceType::DmaWrite);
-        self.sys.write_dma(&source, buf, pos);
+    pub(crate) fn read_dma(&self, raw : RawFd, buf : &'a mut [u8], pos : u64) -> Pin<Box<Source>> {
+        let source = sys::Source::new(raw, SourceType::DmaRead);
+        self.sys.read_dma(&source.as_ref(), buf, pos);
         source
     }
 
-    pub(crate) fn read_dma(&self, raw : RawFd, buf : &'a mut [u8], pos : u64) -> Rc<Source> {
-        let source = self.insert_source(raw, SourceType::DmaRead);
-        self.sys.read_dma(&source, buf, pos);
-        source
-    }
-
-    pub(crate) fn fdatasync(&self, raw : RawFd) -> Rc<Source> {
-        let source = self.insert_source(raw, SourceType::FdataSync);
-        self.sys.fdatasync(&source);
+    pub(crate) fn fdatasync(&self, raw : RawFd) -> Pin<Box<Source>> {
+        let source = sys::Source::new(raw, SourceType::FdataSync);
+        self.sys.fdatasync(&source.as_ref());
         source
     }
 
     pub(crate) fn fallocate(&self, raw : RawFd,
                             position: u64, size: u64,
                             flags: libc::c_int)
-        -> Rc<Source>
-    {
-        let source = self.insert_source(raw, SourceType::Fallocate);
-        self.sys.fallocate(&source, position, size, flags);
+        -> Pin<Box<Source>>     {
+        let source = sys::Source::new(raw, SourceType::Fallocate);
+        self.sys.fallocate(&source.as_ref(), position, size, flags);
         source
     }
 
-    pub(crate) fn close(&self, raw : RawFd) -> Rc<Source> {
-        let source = self.insert_source(raw, SourceType::Close);
-        self.sys.close(&source);
+    pub(crate) fn close(&self, raw : RawFd) -> Pin<Box<Source>> {
+        let source = sys::Source::new(raw, SourceType::Close);
+        self.sys.close(&source.as_ref());
         source
     }
 
     pub(crate) fn open_at(&self,
                           dir   : RawFd,
-                          path  : &CString,
+                          path  : &Path,
                           flags : libc::c_int,
                           mode  : libc::c_int
-    ) -> Rc<Source> {
-        let source = self.insert_source(dir, SourceType::Open);
-        self.sys.open_at(&source, path, flags, mode);
+    ) -> Pin<Box<Source>> {
+
+        let path = CString::new(path.as_os_str().as_bytes())
+                        .expect("path contained null!");
+
+        let source = sys::Source::new(dir, SourceType::Open(path));
+        self.sys.open_at(&source.as_ref(), flags, mode);
         source
     }
 
-    pub(crate) fn insert_pollable_io(&self, raw: RawFd) -> io::Result<Rc<Source>> {
-        let source = self.insert_source(raw, SourceType::PollableFd);
+    pub(crate) fn insert_pollable_io(&self, raw: RawFd) -> io::Result<Pin<Box<Source>>>  {
+        let source = sys::Source::new(raw, SourceType::PollableFd);
         self.sys.insert(raw)?;
         Ok(source)
     }

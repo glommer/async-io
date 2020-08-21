@@ -30,13 +30,13 @@
 //! ```
 
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
+#[macro_use] extern crate nix;
 
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::pin::Pin;
-use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use std::{
@@ -53,8 +53,6 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::parking::Reactor;
 use crate::sys::Source;
-
-use std::ffi::CString;
 
 pub mod parking;
 mod sys;
@@ -235,7 +233,7 @@ impl Future for Timer {
 #[derive(Debug)]
 pub struct Async<T> {
     /// A source registered in the reactor.
-    source: Rc<Source>,
+    source: Pin<Box<Source>>,
 
     /// The inner I/O handle.
     io: Option<Box<T>>,
@@ -631,31 +629,105 @@ fn align_down(v: u64, align: u64) -> u64 {
 }
 
 #[derive(Debug)]
+/// A directory representation where asynchronous operations can be issued
+pub struct Directory {
+    file : std::fs::File,
+}
+
+impl AsRawFd for Directory {
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
+impl From<std::fs::File> for Directory {
+    fn from(file: std::fs::File) -> Self {
+        Directory {
+            file,
+        }
+    }
+}
+
+impl Directory {
+    /// Try creating a clone of this Directory.
+    ///
+    /// The new object has a different file descriptor and has to be
+    /// closed separately.
+    pub fn try_clone(&self) -> io::Result<Directory> {
+        let fd = sys::duplicate_file(self.file.as_raw_fd())?;
+        Ok(Directory {
+            file : unsafe { std::fs::File::from_raw_fd(fd as _) }
+        })
+    }
+
+    /// Synchronously open this directory.
+    pub fn sync_open<P: AsRef<Path>>(path : P) -> io::Result<Directory> {
+        let path = path.as_ref().to_owned();
+        let flags = libc::O_CLOEXEC | libc::O_DIRECTORY;
+        let fd = sys::sync_open(&path, flags, 0o755)?;
+        Ok(Directory{ file : unsafe { std::fs::File::from_raw_fd(fd as _) } })
+    }
+
+    /// Asynchronously open the directory at path
+    pub async fn open<P: AsRef<Path>>(path: P) -> io::Result<Directory> {
+        let path = path.as_ref().to_owned();
+        let flags = libc::O_DIRECTORY | libc::O_CLOEXEC;
+        let source = Reactor::get().open_at(-1, &path, flags, 0o755);
+        let fd = source.collect_rw().await?;
+        Ok(Directory{ file : unsafe { std::fs::File::from_raw_fd(fd as _) } })
+    }
+
+    /// Similar to create() in the standard library, but returns a DMA file
+    pub async fn create<P: AsRef<Path>>(path: P) -> io::Result<Directory> {
+        let path = path.as_ref().to_owned();
+        match std::fs::create_dir(&path) {
+            Ok(_) => Ok(()),
+            Err(x) => {
+                match x.kind() {
+                    std::io::ErrorKind::AlreadyExists => Ok(()),
+                    _ => Err(x),
+                }
+            }
+        }?;
+        Self::open(&path).await
+    }
+
+    /// Issues fdatasync into the underlying file. 
+    pub async fn sync(&self) -> io::Result<()> {
+        let source = Reactor::get().fdatasync(self.as_raw_fd());
+        source.collect_rw().await?;
+        Ok(())
+    }
+
+    /// Closes this DMA file.
+    pub async fn close(&mut self) -> io::Result<()> {
+        let source = Reactor::get().close(self.as_raw_fd());
+        source.collect_rw().await?;
+        self.file = unsafe { std::fs::File::from_raw_fd(-1) };
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 /// Constructs a file that can issue DMA operations.
 /// All access uses Direct I/O, and all operations including
 /// open and close are asynchronous.
 pub struct DmaFile {
     file : std::fs::File,
+    o_direct_alignment: u64,
 }
 
 impl DmaFile {
     // FIXME: Don't assume 512, we can read this info from sysfs
     /// align a value up to the minimum alignment needed to access this file
     pub fn align_up(&self, v: u64) -> u64 {
-        align_up(v, 512)
+        align_up(v, self.o_direct_alignment)
     }
+
 
     /// align a value down to the minimum alignment needed to access this file
     pub fn align_down(&self, v: u64) -> u64 {
-        align_down(v, 512)
-    }
-
-    /// Constructs a a new DMA file
-    pub fn new(file : std::fs::File) -> io::Result<DmaFile> {
-        sys::add_flag(file.as_raw_fd(), libc::O_DIRECT | libc::O_DSYNC)?;
-        Ok(DmaFile {
-            file,
-        })
+        align_down(v, self.o_direct_alignment)
     }
 }
 
@@ -664,7 +736,6 @@ impl AsRawFd for DmaFile {
         self.file.as_raw_fd()
     }
 }
-
 
 impl PartialEq for DmaFile {
     fn eq(&self, other: &Self) -> bool {
@@ -684,6 +755,7 @@ impl Default for DmaFile {
     fn default() -> Self {
         DmaFile {
             file : unsafe { std::fs::File::from_raw_fd(-1) },
+            o_direct_alignment: 4096,
         }
     }
 }
@@ -698,25 +770,39 @@ impl Drop for DmaFile {
 }
 
 impl DmaFile {
-    async fn open_at(dir : RawFd, path : &str, flags: libc::c_int, mode: libc::c_int) -> io::Result<DmaFile> {
-        let path = CString::new(path)?;
-        let source = Reactor::get().open_at(dir, &path, flags, mode);
+    async fn open_at(dir : RawFd,
+                     path : &Path,
+                     flags: libc::c_int,
+                     mode: libc::c_int) -> io::Result<DmaFile>
+    {
+        let source = Reactor::get().open_at(dir, path, flags, mode);
         let fd = source.collect_rw().await?;
         Ok(DmaFile {
             file : unsafe { std::fs::File::from_raw_fd(fd as _) },
+            o_direct_alignment: 4096,
         })
     }
 
     /// Similar to create() in the standard library, but returns a DMA file
-    pub async fn create(path : &str) -> io::Result<DmaFile> {
-        let flags = libc::O_DIRECT | libc::O_DSYNC | libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY;
-        DmaFile::open_at(-1 as _, path, flags, 0o644).await
+    pub async fn create<P: AsRef<Path>>(path: P) -> io::Result<DmaFile> {
+        // FIXME: because we use the poll ring, we really only support xfs and ext4 for this.
+        // We should check and maybe do something different in that case.
+        let path = path.as_ref().to_owned();
+
+        let flags = libc::O_DIRECT | libc::O_CLOEXEC | libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY;
+        let mut f = DmaFile::open_at(-1 as _, &path, flags, 0o644).await?;
+        f.o_direct_alignment = 4096;
+        Ok(f)
     }
 
     /// Similar to open() in the standard library, but returns a DMA file
-    pub async fn open(path : &str) -> io::Result<DmaFile> {
-        let flags = libc::O_DIRECT | libc::O_DSYNC | libc::O_RDONLY;
-        DmaFile::open_at(-1 as _, path, flags, 0644).await
+    pub async fn open<P: AsRef<Path>>(path: P) -> io::Result<DmaFile> {
+        let path = path.as_ref().to_owned();
+
+        let flags = libc::O_DIRECT | libc::O_CLOEXEC | libc::O_RDONLY;
+        let mut f = DmaFile::open_at(-1 as _, &path, flags, 0o644).await?;
+        f.o_direct_alignment = 512;
+        Ok(f)
     }
 
     /// Writes the buffer in buf to a specific position in the file.
@@ -744,13 +830,31 @@ impl DmaFile {
         Ok(())
     }
 
-    /// FIXME: file extension, and not general fallocate, is probably a better
-    /// abstraction
-    pub async fn fallocate(&self, position: u64, size: u64) -> io::Result<()> {
-        let flags = libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE;
-        let source = Reactor::get().fallocate(self.as_raw_fd(), position, size, flags);
+    /// pre-allocates space in the filesystem to hold a file at least as big as the size argument
+    pub async fn pre_allocate(&self, size: u64) -> io::Result<()> {
+        let flags = libc::FALLOC_FL_ZERO_RANGE;
+        let source = Reactor::get().fallocate(self.as_raw_fd(), 0, size, flags);
         source.collect_rw().await?;
         Ok(())
+    }
+
+    /// Allocating blocks at the filesystem level turns asynchronous writes into threaded
+    /// synchronous writes, as we need to first find the blocks to host the file.
+    ///
+    /// If the extent is larger, that means many blocks are allocated at a time. For instance,
+    /// if the extent size is 1MB, that means that only 1 out of 4 256kB writes will be turned
+    /// synchronous. Combined with diligent use of fallocate we can greatly minimize context
+    /// switches.
+    ///
+    /// It is important not to set the extent size too big. Writes can fail otherwise if the
+    /// extent can't be allocated
+    pub async fn hint_extent_size(&self, size: usize) -> nix::Result<i32> {
+        sys::fs_hint_extentsize(self.as_raw_fd(), size)
+    }
+
+    /// Truncates a file to the specified size
+    pub async fn truncate(&self, size: u64) -> io::Result<()> {
+        sys::truncate_file(self.as_raw_fd(), size)
     }
 
     /// Closes this DMA file.
